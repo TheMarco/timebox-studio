@@ -1,180 +1,109 @@
 # Development Notes
 
-## Scope
+Protocol and implementation reference for controlling a Divoom Timebox Evo from macOS.
+Reverse-engineered from the official Divoom Android app (decompiled with `jadx`) and
+cross-checked against the open `node-divoom-timebox-evo` reimplementation.
 
-Current milestone implements Phase 1 and Phase 2 only:
+## Transport: Bluetooth Classic SPP/RFCOMM
 
-- Native SwiftUI app shell
-- Transport abstraction
-- Mock transport
-- IOBluetooth RFCOMM transport
-- Paired-device scanner
-- CoreBluetooth BLE scanner, GATT inspector, and raw BLE writer
-- Raw hex sender
-- Brightness packet encoder
-- `timeboxctl list`
-- `timeboxctl connect`
-- `timeboxctl send-hex`
-- `timeboxctl brightness`
+The LED protocol is carried over **Bluetooth Classic SPP** (Serial Port Profile,
+RFCOMM) — the same channel the official app opens with
+`createInsecureRfcommSocketToServiceRecord(00001101-0000-1000-8000-00805F9B34FB)`.
+The device is a JieLi (JL) chip exposing `JL_SPP`; the LED endpoint is the **audio-side**
+Bluetooth device (e.g. `Timebox-Evo-audio`).
 
-Pixel editing, image packets, and animation are not implemented yet.
+The device's BLE "Transparent UART" endpoint (`Timebox-Evo-light`, ISSC/Microchip
+`49535343-…` service) is **not** wired to the LED protocol — writes succeed at the GATT
+layer but nothing renders, and a request-settings readback draws no reply. Dead end.
 
-## Protocol Assumptions
+### IOBluetooth run loop (the key macOS pitfall)
 
-The app and CLI generate the first real Timebox Evo packet: brightness.
+IOBluetooth delivers RFCOMM open/write callbacks on the **main run loop**, not a dispatch
+queue or an arbitrary thread's run loop. Calling the *synchronous* `openRFCOMMChannelSync`
+from a GCD worker (no running run loop) lets the baseband connect but silently drops the
+channel-negotiation callback → generic `kIOReturnError`. The fix
+(`IOBluetoothTimeboxTransport`): use the **async** APIs (`openRFCOMMChannelAsync` +
+`rfcommChannelOpenComplete`, `writeAsync` + `rfcommChannelWriteComplete`) and either pump
+the main run loop (CLI: `connectPumpingRunLoop`/`writePumpingRunLoop`) or rely on the
+app's already-running run loop (async `connect`/`write`).
 
-The brightness encoder is ported from:
+### Channel resolution (device-agnostic)
 
-- `RomRider/node-divoom-timebox-evo`
-- `PROTOCOL.md` in that repository
+Don't hardcode the channel. Resolve it per device from SDP:
+`IOBluetoothDevice.getServiceRecord(for: IOBluetoothSDPUUID(uuid16: 0x1101))` then
+`getRFCOMMChannelID(_:)`. This matches whatever channel that user's firmware uses.
+`--channel` / the `channel:` argument overrides.
 
-Packet code should stay inside `TimeboxStudio/TimeboxKit`.
+### Reliability
 
-Implemented packet wrapper:
+Per-command connect→write→close drops commands because tearing the channel down mid-parse
+truncates the firmware. One-shot sends add a post-connect settle (~150 ms) and post-write
+hold (default 500 ms, `--hold-ms`) plus connect retries; the `repl` holds **one persistent
+connection** (the app's model) and never reconnects between commands.
 
-```text
-01 LLLL PAYLOAD CRCR 02
-```
+### macOS quirk
 
-Brightness payload:
+macOS auto-connects the paired speaker and grabs its SPP channel; a fresh open then times
+out. **Power-cycle the Timebox** to free it. A second `JL_SPP` channel opens but is a dead
+secondary endpoint — don't fall back to it.
 
-```text
-74 BB
-```
-
-For `brightness 50`, `BB` is `32`, length is `04 00`, checksum is `AA 00`, and the full packet is:
-
-```text
-01 04 00 74 32 AA 00 02
-```
-
-## Packet Examples
-
-Raw bytes entered in the app or CLI are parsed with these accepted formats:
+## Packet framing
 
 ```text
-AA BB CC
-0xAA,0xBB,0xCC
-AA-BB-CC
-AA:BB:CC
+01  LEN(LE16)  CMD  PAYLOAD…  CRC(LE16)  02
 ```
 
-The app logs:
+- start `0x01`, end `0x02`.
+- `LEN` = number of bytes in `CMD + PAYLOAD + CRC` = `payload.count + 2` (little-endian).
+- `CRC` = `sum(LEN bytes + CMD + PAYLOAD) & 0xFFFF` (little-endian).
+- Byte `[3]` is always the command opcode.
 
-- outgoing packet hex
-- packet byte count
-- transport success/failure
+Two device modes exist in the app: **NewMode** (raw, no escaping) and **OldMode** (byte-
+stuffs `01→03 04`, `02→03 05`, `03→03 06` between the markers). The **Timebox Evo is
+NewMode** — confirmed because a raw color packet containing literal `0x01` bytes renders
+correctly. `TimeboxPacketEncoder.encodePayload` implements NewMode and is byte-identical
+to `node-divoom-timebox-evo`'s message framing. `TimeboxByteEscaper` is a placeholder for
+OldMode if an older device ever needs it (algorithm above).
 
-Brightness command logs include:
+## Commands (`SppProc$CMD_TYPE`)
 
-- command name
-- command parameters
-- checksum, if applicable
-- raw packet hex
+| Command            | Opcode      | Payload (after opcode)                              |
+|--------------------|-------------|----------------------------------------------------|
+| Set brightness     | `0x74` (116)| `BB` (0–100)                                        |
+| Plain color        | `0x45` (69) | `01 RR GG BB level type power 00 00 00`             |
+| Static image       | `0x44` (68) | see below                                           |
 
-## Bluetooth Assumptions
+Examples: brightness 50 → `01 04 00 74 32 AA 00 02`; red fill →
+`01 0D 00 45 01 FF 00 00 64 00 01 00 00 00 B7 01 02`.
 
-Initial exploration assumed Bluetooth Classic RFCOMM for LED control, but local device discovery shows the LED display-side device advertising over BLE as:
+## Static image encoding (`TimeboxImageEncoder`)
+
+Inner payload (before the `01 … CRC 02` envelope):
 
 ```text
-Timebox-Evo-light
+44 00 0A 0A 04   AA  LLLL(LE)  00 00 00   NN   <palette RGB…>   <packed pixels…>
 ```
 
-Observed advertised BLE service:
+- `44 00 0A 0A 04` — command + fixed static-image header.
+- `AA` — frame marker; `LLLL` = full frame length (little-endian) = `6 + body.count`,
+  where `body = NN + palette + packed pixels`.
+- `00 00 00` — static-image time/reset bytes.
+- `NN` = palette color count mod 256 (256 colors → `00`).
+- palette — `NN` unique colors in first-seen order, 3 bytes RGB each.
+- pixels — each pixel's palette index packed **LSB-first** using
+  `max(1, ceil(log2(NN)))` bits, in **row-major** order, **top-left pixel first**.
 
-```text
-AF30
-```
+The official app's `pixelEncode` is native (NDK `.so`, not decompilable); this format is
+the documented equivalent from `node-divoom-timebox-evo` (`jimp_overloads.ts`). PNG/JPG
+input is rasterized to 16×16 (nearest-neighbor, top-left origin) by
+`ImageToPixelFrameConverter` using CoreGraphics — note the `CGBitmapContext` buffer is
+**top-left origin** (`buffer[0]` = top-left pixel), so no vertical flip is applied.
 
-Observed GATT service after connection:
+## Accepted raw-hex input formats
 
-```text
-49535343-FE7D-4AE5-8FA9-9FAFD205E455
-```
+`AA BB CC`, `0xAA,0xBB,0xCC`, `AA-BB-CC`, `AA:BB:CC`.
 
-Likely Transparent UART write characteristic:
+## References
 
-```text
-49535343-8841-43F4-A8D4-ECBE34729BB3
-```
-
-Likely Transparent UART notify/readback characteristic:
-
-```text
-49535343-1E4D-4BD9-BA61-23C647249616
-```
-
-The audio-side device may appear separately:
-
-```text
-Timebox-evo-audio
-```
-
-The paired-device scanner lists all paired Classic devices and visually marks names containing `Timebox`.
-
-If the light/control side is paired under an unexpected name, use SDP inspection:
-
-```sh
-.build/debug/timeboxctl inspect --address "fa-5e-6f-6e-79-42"
-```
-
-Look for services with a non-empty `RFCOMM` channel. Those are the best candidates for raw packet tests.
-
-If SDP inspection hangs or times out, bypass SDP:
-
-```sh
-.build/debug/timeboxctl probe-rfcomm --address "fa-5e-6f-6e-79-42"
-.build/debug/timeboxctl connect --address "fa-5e-6f-6e-79-42" --channel 1
-```
-
-For CLI Bluetooth testing, run the built executable directly:
-
-```sh
-.build/debug/timeboxctl list
-.build/debug/timeboxctl scan --seconds 12
-.build/debug/timeboxctl scan-ble --seconds 12
-.build/debug/timeboxctl inspect-ble --uuid "BE32D255-6999-AE59-4577-4F5BDA0458D3" --service AF30
-```
-
-Classic RFCOMM remains in the prototype for exploration, but the real `Timebox-Evo-light` control endpoint seen locally is BLE Transparent UART. Current real-device testing should prioritize:
-
-```sh
-.build/debug/timeboxctl inspect-ble --uuid "BE32D255-6999-AE59-4577-4F5BDA0458D3"
-.build/debug/timeboxctl brightness 50 --uuid "BE32D255-6999-AE59-4577-4F5BDA0458D3"
-```
-
-In local verification, `swift run timeboxctl list` was terminated before app code received control, while `.build/debug/timeboxctl list` returned normally. This appears to be SwiftPM launch-wrapper interaction with macOS Bluetooth privacy/TCC rather than scanner logic.
-
-## RFCOMM Channel Discovery
-
-`IOBluetoothTimeboxTransport` reads RFCOMM channel IDs from the paired device's SDP service records:
-
-```swift
-serviceRecord.getRFCOMMChannelID(&channelID)
-```
-
-If no RFCOMM channel is visible through SDP, the transport tries channel `1` as a fallback. The UI and CLI report the channel used when connection succeeds.
-
-Failures include exact `IOReturn` numeric and hex codes. Common causes:
-
-- device is not paired
-- device is asleep or out of range
-- wrong device selected, for example audio-side device
-- macOS denied Bluetooth access
-- RFCOMM channel ID is wrong
-
-## Entitlement Note
-
-For a personal prototype, this package is not sandboxed. For later packaging or App Store-style distribution, add the Bluetooth entitlement:
-
-```text
-com.apple.security.device.bluetooth
-```
-
-## TODO Byte Ranges
-
-These are intentionally unverified until the next protocol ports begin:
-
-- escape/framing bytes
-- solid-color command payload
-- image payload layout for 16x16 RGB frames
+- Official Divoom Android app (decompiled, `apk/` — git-ignored, copyrighted).
+- `node-divoom-timebox-evo` `PROTOCOL.md`, `src/drawing/jimp_overloads.ts`, `src/messages/message.ts`.
