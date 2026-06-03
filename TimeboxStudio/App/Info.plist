@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.timeboxstudio.prototype</string>
+	<key>CFBundleName</key>
+	<string>Timebox Studio</string>
+	<key>CFBundleDisplayName</key>
+	<string>Timebox Studio</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Timebox Studio lists paired Bluetooth devices and opens an RFCOMM channel to control the Timebox Evo LED display.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Timebox Studio uses Bluetooth to control the Timebox Evo LED display.</string>
+</dict>
+</plist>

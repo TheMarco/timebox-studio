@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+
+# Decompiled official Divoom APK — used only for protocol reverse-engineering.
+# Copyrighted; do not commit.
+apk/
+
+# Local/ad-hoc test assets
+test.png
