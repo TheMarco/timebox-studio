@@ -57,7 +57,7 @@ public final class TimeboxClient {
         }
     }
 
-    /// Connect by Bluetooth address (e.g. `"b1-21-81-41-c0-f0"`). Channel is
+    /// Connect by Bluetooth address (e.g. `"AA-BB-CC-DD-EE-FF"`). Channel is
     /// auto-resolved unless provided.
     public func connect(address: String, channel: UInt8? = nil) async throws {
         let device = TimeboxDevice(

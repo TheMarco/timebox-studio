@@ -963,10 +963,10 @@ enum TimeboxCLI {
               timeboxctl scan-ble [--seconds 12]
               timeboxctl inspect-ble --uuid "BE32D255-6999-AE59-4577-4F5BDA0458D3" [--service AF30]
               timeboxctl send-ble-hex --uuid "BE32D255-6999-AE59-4577-4F5BDA0458D3" [--characteristic UUID] [--with-response | --without-response] "AA BB CC"
-              timeboxctl brightness 50 --address b1-21-81-41-c0-f0 [--channel 1]        (Classic SPP, verified Timebox Evo path)
-              timeboxctl color FF0000 --address b1-21-81-41-c0-f0 [--channel 1] [--brightness 100]   (Classic SPP)
-              timeboxctl image test.png --address b1-21-81-41-c0-f0 [--channel 1]    (PNG/JPG -> 16x16 picture on the display)
-              timeboxctl repl --address b1-21-81-41-c0-f0 [--channel 1]              (interactive: one persistent SPP connection, stream commands)
+              timeboxctl brightness 50 --address AA-BB-CC-DD-EE-FF [--channel 1]        (Classic SPP, verified Timebox Evo path)
+              timeboxctl color FF0000 --address AA-BB-CC-DD-EE-FF [--channel 1] [--brightness 100]   (Classic SPP)
+              timeboxctl image test.png --address AA-BB-CC-DD-EE-FF [--channel 1]    (PNG/JPG -> 16x16 picture on the display)
+              timeboxctl repl --address AA-BB-CC-DD-EE-FF [--channel 1]              (interactive: one persistent SPP connection, stream commands)
               timeboxctl brightness 50 --uuid "BE32D255-...-0458D3"                    (BLE; legacy/diagnostic, no visible effect on Evo)
               timeboxctl color FF0000 --uuid "BE32D255-...-0458D3" [--brightness 100]  (BLE; legacy/diagnostic)
               timeboxctl listen-ble --uuid "BE32D255-6999-AE59-4577-4F5BDA0458D3" [--seconds 20] [--request-settings | "01 03 00 46 49 00 02"] [--with-response | --without-response]
@@ -1183,7 +1183,7 @@ private enum CLIError: LocalizedError {
         case .invalidColor(let value):
             return "Invalid color '\(value)'. Use a 6-digit RGB hex value, for example FF0000."
         case .missingImagePath:
-            return "Missing image path. Example: timeboxctl image test.png --address b1-21-81-41-c0-f0"
+            return "Missing image path. Example: timeboxctl image test.png --address AA-BB-CC-DD-EE-FF"
         case .missingDeviceSelector(let command):
             return "Missing device selector for \(command). Use --name or --address."
         case .invalidChannel(let value):
