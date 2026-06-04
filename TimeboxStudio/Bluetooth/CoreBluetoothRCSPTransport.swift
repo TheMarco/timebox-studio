@@ -31,7 +31,16 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
     private var seq: UInt8 = 0
 
     public var onConnectionChange: ((Bool) -> Void)?
-    private var autoReconnect = false
+    private var autoReconnect = false         // we've connected once; keep the link alive
+    private var lastIdentifier: UUID?         // remembered peripheral, for retrieve-on-reconnect
+    private var reconnectPending = false
+
+    // Liveness: the device ACKs/heartbeats on its notify channel. Track in/out timing so a
+    // silently-wedged link (write-without-response gives no error) can be detected and reset.
+    private var lastInbound = Date.distantPast
+    private var lastOutbound = Date.distantPast
+    private var sawInbound = false
+    private var watchdog: DispatchSourceTimer?
 
     private var pendingPower: CheckedContinuation<Void, Error>?
     private var pendingConnect: CheckedContinuation<Void, Error>?
@@ -40,6 +49,8 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
     private var writeChunks: [Data] = []
     private var writeType: CBCharacteristicWriteType = .withoutResponse
     private var pumpScheduled = false
+    private var writeID = 0
+    private let writeTimeout: TimeInterval = 3   // a single packet should never take this long
 
     public override init() {
         super.init()
@@ -68,6 +79,7 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
 
     public func disconnect() {
         autoReconnect = false               // explicit disconnect — don't try to come back
+        stopWatchdog()
         central.stopScan()
         writeChunks.removeAll()
         if let p = peripheral { central.cancelPeripheralConnection(p) }
@@ -98,6 +110,17 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
         }
         let (rcsp, cont) = writeQueue.removeFirst()
         activeCont = cont
+        lastOutbound = Date()
+        // write-without-response can't error, so a wedged link (or being suspended mid-write
+        // when another app grabs the radio) would hang this write — and the whole render loop
+        // awaiting it — forever. Bound it: if the packet hasn't completed in time, the link is
+        // dead, so fail it (unblocking the loop) and force a reconnect.
+        writeID &+= 1
+        let id = writeID
+        DispatchQueue.main.asyncAfter(deadline: .now() + writeTimeout) { [weak self] in
+            guard let self, self.activeCont != nil, self.writeID == id else { return }
+            self.forceReconnect()
+        }
         writeType = rx.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
         let mtu = max(20, peripheral.maximumWriteValueLength(for: writeType))
         var chunks: [Data] = []
@@ -189,6 +212,88 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
         }
     }
 
+    // MARK: - Aggressive reconnect
+
+    /// After an unexpected drop, keep trying to re-establish the link every couple of
+    /// seconds until we're back (or `disconnect()` clears `autoReconnect`). Each round
+    /// tries the cheapest path first: re-attach if the system still holds the device (it's
+    /// also a BT speaker), reconnect a known peripheral (CoreBluetooth makes that
+    /// persistent — it fires the moment the device is reachable), then fall back to scanning.
+    private func scheduleReconnect(delay: TimeInterval = 0) {
+        guard autoReconnect, !reconnectPending else { return }
+        reconnectPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.reconnectPending = false
+            self?.attemptReconnect()
+        }
+    }
+
+    private func attemptReconnect() {
+        guard autoReconnect, !isConnected else { return }
+        guard central.state == .poweredOn else { return }   // the poweredOn handler re-kicks us
+
+        if let p = central.retrieveConnectedPeripherals(withServices: [serviceUUID]).first {
+            attach(p)                                        // system still holds it (speaker)
+        } else if let id = lastIdentifier,
+                  let p = central.retrievePeripherals(withIdentifiers: [id]).first {
+            attach(p)                                        // known peripheral — persistent connect
+        } else if let p = peripheral {
+            attach(p)
+        } else {
+            central.scanForPeripherals(withServices: nil, options: nil)
+        }
+        scheduleReconnect(delay: 2.0)                        // ...and keep at it until connected
+    }
+
+    private func attach(_ p: CBPeripheral) {
+        central.stopScan()
+        peripheral = p
+        p.delegate = self
+        central.connect(p, options: nil)
+    }
+
+    // MARK: - Liveness watchdog
+
+    /// write-without-response reports no delivery error, so a silently-wedged BLE link looks
+    /// "connected" forever while frames vanish into the void — the classic "frozen but the app
+    /// thinks it's fine" failure. The device ACKs/heartbeats on its notify channel, so if we're
+    /// actively sending yet hear nothing back for a few seconds, the link is dead: drop it,
+    /// which triggers `didDisconnect` → the reconnect loop, reviving the session.
+    private func startWatchdog() {
+        stopWatchdog()
+        lastInbound = Date()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 2, repeating: 2)
+        t.setEventHandler { [weak self] in self?.checkLiveness() }
+        t.resume()
+        watchdog = t
+    }
+
+    private func stopWatchdog() {
+        watchdog?.cancel()
+        watchdog = nil
+    }
+
+    private func checkLiveness() {
+        guard isConnected, sawInbound, peripheral != nil else { return }
+        let now = Date()
+        let activelySending = now.timeIntervalSince(lastOutbound) < 3      // we're streaming frames
+        let goneQuiet = now.timeIntervalSince(lastInbound) > 5             // ...but it stopped replying
+        if activelySending && goneQuiet { forceReconnect() }
+    }
+
+    /// Tear down a wedged link so the reconnect loop can revive it: unblock any stuck write
+    /// (so the render loop stops awaiting it), flag the drop, and cancel the connection —
+    /// which fires `didDisconnect` → `scheduleReconnect()`.
+    private func forceReconnect() {
+        guard let p = peripheral else { return }
+        sawInbound = false
+        rxChar = nil                                    // isConnected → false; stop new writes
+        finishWrite(.failure(TimeboxTransportError.notConnected))
+        onConnectionChange?(false)
+        central.cancelPeripheralConnection(p)
+    }
+
     private func withConnectContinuation(_ start: () -> Void) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             pendingConnect = cont
@@ -231,6 +336,7 @@ extension CoreBluetoothRCSPTransport: CBCentralManagerDelegate, CBPeripheralDele
         switch central.state {
         case .poweredOn:
             resumePower(.success(()))
+            if autoReconnect, !isConnected { scheduleReconnect() }   // BT toggled back on
         case .unsupported, .unauthorized:
             resumePower(.failure(TimeboxTransportError.bluetoothUnavailable))
         default:
@@ -249,22 +355,27 @@ extension CoreBluetoothRCSPTransport: CBCentralManagerDelegate, CBPeripheralDele
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        seq = 0                              // fresh GATT session — device counts seq from 1 again
+        lastIdentifier = peripheral.identifier
         peripheral.discoverServices([serviceUUID])
     }
 
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        resumeConnect(.failure(error ?? TimeboxTransportError.notConnected))
+        if pendingConnect != nil {
+            resumeConnect(.failure(error ?? TimeboxTransportError.notConnected))
+        } else if autoReconnect {
+            scheduleReconnect(delay: 1.0)    // mid-reconnect failure — keep hammering
+        }
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         rxChar = nil
+        stopWatchdog()
         finishWrite(.failure(TimeboxTransportError.notConnected))
         onConnectionChange?(false)
-        // Auto-reconnect: ask CoreBluetooth to reconnect whenever the device is available
-        // again (no timeout). Survives iOS tearing the link down during app transitions.
-        if autoReconnect, let p = self.peripheral {
-            central.connect(p, options: nil)
-        }
+        // Self-healing reconnect loop: re-attach / reconnect / scan every couple of seconds
+        // until the device is back. Survives iOS tearing the link down during app transitions.
+        if autoReconnect { scheduleReconnect() }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -282,6 +393,7 @@ extension CoreBluetoothRCSPTransport: CBCentralManagerDelegate, CBPeripheralDele
         }
         if rxChar != nil {
             autoReconnect = true
+            startWatchdog()
             if pendingConnect != nil {
                 resumeConnect(.success(()))   // initial connect
             } else {
@@ -299,6 +411,12 @@ extension CoreBluetoothRCSPTransport: CBCentralManagerDelegate, CBPeripheralDele
 
     public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
         if writeType == .withoutResponse { pumpWrites() }
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        // Any notify traffic (command ACK or heartbeat) proves the link is alive.
+        sawInbound = true
+        lastInbound = Date()
     }
 }
 #endif
