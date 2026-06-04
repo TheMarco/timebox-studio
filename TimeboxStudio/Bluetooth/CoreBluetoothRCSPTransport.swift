@@ -30,11 +30,16 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
     private var nameHint = "timebox"
     private var seq: UInt8 = 0
 
+    public var onConnectionChange: ((Bool) -> Void)?
+    private var autoReconnect = false
+
     private var pendingPower: CheckedContinuation<Void, Error>?
     private var pendingConnect: CheckedContinuation<Void, Error>?
-    private var pendingWrite: CheckedContinuation<Void, Error>?
+    private var writeQueue: [(Data, CheckedContinuation<Void, Error>)] = []
+    private var activeCont: CheckedContinuation<Void, Error>?
     private var writeChunks: [Data] = []
     private var writeType: CBCharacteristicWriteType = .withoutResponse
+    private var pumpScheduled = false
 
     public override init() {
         super.init()
@@ -62,18 +67,37 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
     }
 
     public func disconnect() {
+        autoReconnect = false               // explicit disconnect — don't try to come back
         central.stopScan()
         writeChunks.removeAll()
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         peripheral = nil
         rxChar = nil
-        resumeWrite(.failure(TimeboxTransportError.notConnected))
+        finishWrite(.failure(TimeboxTransportError.notConnected))
     }
 
     public func write(_ data: Data) async throws {
-        guard let peripheral, let rx = rxChar else { throw TimeboxTransportError.notConnected }
+        guard peripheral != nil, rxChar != nil else { throw TimeboxTransportError.notConnected }
         seq = seq &+ 1
         let rcsp = Self.wrapAsRCSP(sppFrame: data, seq: seq)
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            writeQueue.append((rcsp, cont))
+            startNextWrite()
+        }
+    }
+
+    /// Writes are serialized: one runs at a time, the rest queue. This stops a send from a
+    /// background cover refresh (or any caller) from clobbering an in-flight write's
+    /// continuation — which would hang the render loop forever.
+    private func startNextWrite() {
+        guard activeCont == nil, !writeQueue.isEmpty else { return }
+        guard let peripheral, let rx = rxChar else {
+            let pending = writeQueue; writeQueue.removeAll()
+            pending.forEach { $0.1.resume(throwing: TimeboxTransportError.notConnected) }
+            return
+        }
+        let (rcsp, cont) = writeQueue.removeFirst()
+        activeCont = cont
         writeType = rx.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
         let mtu = max(20, peripheral.maximumWriteValueLength(for: writeType))
         var chunks: [Data] = []
@@ -83,11 +107,11 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
             chunks.append(rcsp.subdata(in: i..<end))
             i = end
         }
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            pendingWrite = cont
-            writeChunks = chunks
-            pumpWrites()
-        }
+        writeChunks = chunks
+        // Send the whole packet atomically: the poll keeps draining chunks until done, so
+        // we never abandon a half-written RCSP packet (which corrupts the device's parser
+        // and drops the connection). A real disconnect unblocks us via the delegate.
+        pumpWrites()
     }
 
     // MARK: - RCSP framing
@@ -120,16 +144,27 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
 
     private func pumpWrites() {
         guard let peripheral, let rx = rxChar else {
-            resumeWrite(.failure(TimeboxTransportError.notConnected)); return
+            finishWrite(.failure(TimeboxTransportError.notConnected)); return
         }
         if writeType == .withoutResponse {
             while !writeChunks.isEmpty {
-                if !peripheral.canSendWriteWithoutResponse { return } // resumed by peripheralIsReady
+                if !peripheral.canSendWriteWithoutResponse {
+                    // `peripheralIsReady` is sometimes never delivered, which would hang
+                    // the write (and the whole animation loop) forever. Poll as a fallback.
+                    if !pumpScheduled {
+                        pumpScheduled = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                            self?.pumpScheduled = false
+                            self?.pumpWrites()
+                        }
+                    }
+                    return
+                }
                 peripheral.writeValue(writeChunks.removeFirst(), for: rx, type: .withoutResponse)
             }
-            resumeWrite(.success(()))
+            finishWrite(.success(()))
         } else {
-            guard !writeChunks.isEmpty else { resumeWrite(.success(())); return }
+            guard !writeChunks.isEmpty else { finishWrite(.success(())); return }
             peripheral.writeValue(writeChunks.removeFirst(), for: rx, type: .withResponse)
         }
     }
@@ -172,10 +207,14 @@ public final class CoreBluetoothRCSPTransport: NSObject, TimeboxTransport, @unch
         c.resume(with: result)
     }
 
-    private func resumeWrite(_ result: Result<Void, Error>) {
-        guard let c = pendingWrite else { return }
-        pendingWrite = nil
-        c.resume(with: result)
+    /// Finish the active write and start the next queued one.
+    private func finishWrite(_ result: Result<Void, Error>) {
+        writeChunks.removeAll()
+        if let c = activeCont {
+            activeCont = nil
+            c.resume(with: result)
+        }
+        startNextWrite()
     }
 
     private func resumePower(_ result: Result<Void, Error>) {
@@ -219,7 +258,13 @@ extension CoreBluetoothRCSPTransport: CBCentralManagerDelegate, CBPeripheralDele
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         rxChar = nil
-        resumeWrite(.failure(TimeboxTransportError.notConnected))
+        finishWrite(.failure(TimeboxTransportError.notConnected))
+        onConnectionChange?(false)
+        // Auto-reconnect: ask CoreBluetooth to reconnect whenever the device is available
+        // again (no timeout). Survives iOS tearing the link down during app transitions.
+        if autoReconnect, let p = self.peripheral {
+            central.connect(p, options: nil)
+        }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -236,14 +281,19 @@ extension CoreBluetoothRCSPTransport: CBCentralManagerDelegate, CBPeripheralDele
             if c.uuid == txUUID { peripheral.setNotifyValue(true, for: c) }
         }
         if rxChar != nil {
-            resumeConnect(.success(()))
+            autoReconnect = true
+            if pendingConnect != nil {
+                resumeConnect(.success(()))   // initial connect
+            } else {
+                onConnectionChange?(true)     // came back after a drop
+            }
         } else {
             resumeConnect(.failure(TimeboxTransportError.noRFCOMMChannel(nameHint)))
         }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        if let error { resumeWrite(.failure(error)); return }
+        if let error { finishWrite(.failure(error)); return }
         if writeType == .withResponse { pumpWrites() }
     }
 

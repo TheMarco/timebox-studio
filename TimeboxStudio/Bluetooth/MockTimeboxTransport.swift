@@ -4,6 +4,7 @@ import TimeboxUtilities
 
 public final class MockTimeboxTransport: TimeboxTransport, TimeboxTransportDiagnostics {
     public private(set) var isConnected = false
+    public var onConnectionChange: ((Bool) -> Void)?
     public private(set) var lastRFCOMMChannelID: UInt8? = 1
 
     public init() {

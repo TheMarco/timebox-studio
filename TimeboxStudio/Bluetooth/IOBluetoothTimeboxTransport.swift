@@ -23,6 +23,7 @@ private final class CompletionFlag {
 public final class IOBluetoothTimeboxTransport: TimeboxTransport, TimeboxTransportDiagnostics, @unchecked Sendable {
     public private(set) var isConnected = false
     public private(set) var lastRFCOMMChannelID: UInt8?
+    public var onConnectionChange: ((Bool) -> Void)?   // Classic SPP doesn't auto-reconnect; unused
 
     #if canImport(IOBluetooth)
     private var bluetoothDevice: IOBluetoothDevice?

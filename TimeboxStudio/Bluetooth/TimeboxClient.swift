@@ -36,6 +36,12 @@ public final class TimeboxClient {
 
     public var isConnected: Bool { transport.isConnected }
 
+    /// Notified when the link unexpectedly drops or auto-reconnects (`true` = connected).
+    public var onConnectionChange: ((Bool) -> Void)? {
+        get { transport.onConnectionChange }
+        set { transport.onConnectionChange = newValue }
+    }
+
     // MARK: - Discovery
 
     /// All paired Bluetooth devices — present these so the user can pick their

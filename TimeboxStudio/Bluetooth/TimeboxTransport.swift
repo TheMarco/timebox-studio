@@ -7,6 +7,10 @@ import IOKit
 public protocol TimeboxTransport: AnyObject {
     var isConnected: Bool { get }
 
+    /// Fires when the link goes up/down outside an explicit `connect`/`disconnect`
+    /// (e.g. an unexpected drop, or a successful auto-reconnect). `true` = connected.
+    var onConnectionChange: ((Bool) -> Void)? { get set }
+
     func connect(to device: TimeboxDevice) async throws
     func disconnect()
     func write(_ data: Data) async throws
