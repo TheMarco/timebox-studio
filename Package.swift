@@ -10,7 +10,8 @@ let cliInfoPlist = "\(packageDirectory)/timeboxctl/Info.plist"
 let package = Package(
     name: "TimeboxStudio",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v13),
+        .iOS(.v15)
     ],
     products: [
         .executable(name: "TimeboxStudio", targets: ["TimeboxStudio"]),
@@ -34,7 +35,7 @@ let package = Package(
             path: "TimeboxStudio/Bluetooth",
             linkerSettings: [
                 .linkedFramework("CoreBluetooth"),
-                .linkedFramework("IOBluetooth")
+                .linkedFramework("IOBluetooth", .when(platforms: [.macOS]))
             ]
         ),
         .target(

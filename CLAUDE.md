@@ -3,15 +3,20 @@
 Handoff notes for the Timebox Studio project. Workspace root:
 `/Users/marcovhv/projects/GIT/TimeBox` (a Swift Package + lightweight Xcode workspace).
 
-## Status: SOLVED
+## Status: SOLVED (macOS + iOS)
 
-Native macOS control of a Divoom **Timebox Evo** (16×16 LED display) works end to end —
-solid color, brightness, and **arbitrary 16×16 images** render on real hardware. No
-Divoom app, Node, Electron, or microcontroller.
+Native control of a Divoom **Timebox Evo** (16×16 LED display) works end to end on both
+**macOS and iOS** — solid color, brightness, and **arbitrary 16×16 images** render on
+real hardware. No Divoom app, Node, Electron, or microcontroller.
 
-The control path is **Bluetooth Classic SPP/RFCOMM**, driven with `IOBluetooth`. The
-BLE "Transparent UART" endpoint the device advertises is a dead end (not wired to the
-LED protocol) — don't revisit it.
+- **macOS:** **Bluetooth Classic SPP/RFCOMM**, driven with `IOBluetooth`.
+- **iOS:** **BLE** (`CoreBluetooth`). IOBluetooth doesn't exist on iOS, so the BLE
+  "Transparent UART" endpoint *is* the path — but only via the JieLi **RCSP** wrapper and
+  the device's `01` command channel (see Protocol below). The earlier "BLE is a dead end"
+  note was only true for sending raw SPP frames straight at the endpoint; wrapped in RCSP
+  and tunneled through the `01` channel it works. `CoreBluetoothRCSPTransport` implements it.
+
+`TimeboxClient` picks the transport per platform; the app-facing API is identical.
 
 ## Build / test / run
 
@@ -34,9 +39,10 @@ TimeboxUtilities   hex parsing, hex dump, logging (leaf)
 TimeboxKit         protocol encoding ONLY — PixelFrame/PixelRGB, TimeboxCommand,
                    TimeboxPacketEncoder, TimeboxImageEncoder, TimeboxChecksum,
                    ImageToPixelFrameConverter (PNG/JPG -> 16x16, CoreGraphics)
-TimeboxBluetooth   transport + high-level API — TimeboxClient, IOBluetoothTimeboxTransport
-                   (Classic SPP), BluetoothDeviceScanner (discovery), plus the
-                   CoreBluetooth* BLE diagnostic code (kept for reference)
+TimeboxBluetooth   transport + high-level API — TimeboxClient (per-platform transport),
+                   IOBluetoothTimeboxTransport (macOS Classic SPP, #if canImport(IOBluetooth)),
+                   CoreBluetoothRCSPTransport (iOS/macOS BLE via RCSP), BluetoothDeviceScanner
+                   (discovery), plus the CoreBluetooth* BLE diagnostic code (reference)
 TimeboxPersistence SavedDesign / DesignStore
 TimeboxStudio      minimal SwiftUI app shell        timeboxctl  CLI
 ```
@@ -61,11 +67,25 @@ Encoding stays separate from transport. The library products are `TimeboxKit` an
 - **Reliability:** the device drops commands if the channel is torn down mid-parse, so
   one-shot sends settle/hold around the write; the `repl` keeps one persistent connection.
 
-## Protocol (reverse-engineered from the official Android APK)
+### iOS BLE (CoreBluetoothRCSPTransport)
+
+- Service `49535343-FE7D-…`; write (no-response) to RX `…8841` (handle 0x000d); notify on
+  TX `…1E4D` (handle 0x000f). The Timebox is also a BT speaker, so iOS often already holds
+  it connected (then it stops advertising) — `retrieveConnectedPeripherals` attaches; else scan by name.
+- **`TimeboxClient` hands every command down as a full SPP frame; the transport strips the
+  envelope and re-wraps it.** RCSP frame: `FE EF AA 55 | LEN(LE16) | 01 <seq> 00 00 00
+  <SPP payload> | SUM16(LEN+body)(LE16)`, `LEN = body+2`, same sum16 as SPP. `seq`
+  increments per command from 1 on connect; device ACKs with SPP notify `01 .. 04 33 55 <seq> ..`.
+- **Dead ends (don't retry):** the `00 01 <json>` (e.g. `Device/SetUTC`) and `00 9E <seq>
+  <frame>` channels are ACKed but only render in the app's live "Draw sync" design mode.
+  The `01` channel runs ordinary SPP commands with no handshake — use it.
+
+## Protocol (reverse-engineered from the official Android APK + an iOS BLE capture)
 
 Frame: `01 LEN(LE16) CMD payload CRC(LE16) 02`, `LEN = payload.len + 2`,
 `CRC = sum(LEN + payload bytes) & 0xFFFF`. No byte-stuffing (the Evo is "NewMode").
 Implemented byte-for-byte in `TimeboxPacketEncoder` (matches `node-divoom-timebox-evo`).
+The iOS BLE path wraps these exact frames' payloads in RCSP (above).
 
 Key opcodes: brightness `0x74` (`74 BB`); plain color `0x45`
 (`45 01 RRGGBB level type power 00 00 00`); image `0x44`. Image payload (see
@@ -76,8 +96,9 @@ the APK's NDK `.so`; the documented equivalent lives in `node-divoom-timebox-evo
 
 ## What's next (optional)
 
-GIF/animation (`0x44`/`0x49` multi-frame, chunked); wire the SwiftUI app's transport to
-`TimeboxClient`; large-image MTU chunking if a 256-color image ever fails to render.
+GIF/animation (`0x44`/`0x49` multi-frame, chunked); large-image MTU chunking if a
+256-color image ever fails to render. The iOS `timebox-ios` app is a thin `TimeboxClient`
+consumer (separate repo at `../timebox-ios`).
 
 ## Conventions
 

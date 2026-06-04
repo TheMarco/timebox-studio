@@ -9,7 +9,6 @@ import IOBluetooth
 private final class CompletionFlag {
     var isDone = false
 }
-#endif
 
 /// IOBluetooth (Classic) delivers RFCOMM open/write callbacks through the
 /// **main** CFRunLoop, not a dispatch queue and not an arbitrary thread's run
@@ -400,3 +399,4 @@ public final class IOBluetoothTimeboxTransport: TimeboxTransport, TimeboxTranspo
     }
     #endif
 }
+#endif

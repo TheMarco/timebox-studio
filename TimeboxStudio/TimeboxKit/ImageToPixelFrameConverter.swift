@@ -39,7 +39,10 @@ public enum ImageToPixelFrameConverter {
     }
 
     #if canImport(CoreGraphics)
-    public static func pixelFrame(from image: CGImage) throws -> PixelFrame {
+    /// Rasterize a `CGImage` to a 16x16 `PixelFrame`. `interpolation` defaults to
+    /// `.none` (nearest-neighbor, crisp for pixel-art); pass `.high` for photos /
+    /// album art so the downscale is smooth.
+    public static func pixelFrame(from image: CGImage, interpolation: CGInterpolationQuality = .none) throws -> PixelFrame {
         let width = PixelFrame.width
         let height = PixelFrame.height
         let bytesPerPixel = 4
@@ -58,7 +61,7 @@ public enum ImageToPixelFrameConverter {
             throw ImageToPixelFrameError.cannotCreateContext
         }
 
-        context.interpolationQuality = .none // nearest-neighbor, like the official app
+        context.interpolationQuality = interpolation
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
 
         var pixels: [PixelRGB] = []

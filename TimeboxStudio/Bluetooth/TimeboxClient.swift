@@ -25,7 +25,12 @@ import CoreGraphics
 /// is hardcoded to a specific device: the Bluetooth address comes from discovery
 /// and the RFCOMM channel is resolved per device from its SDP records.
 public final class TimeboxClient {
-    private let transport = IOBluetoothTimeboxTransport()
+    #if os(macOS)
+    private let bluetooth = IOBluetoothTimeboxTransport()
+    private var transport: TimeboxTransport { bluetooth }
+    #else
+    private let transport: TimeboxTransport = CoreBluetoothRCSPTransport()
+    #endif
 
     public init() {}
 
@@ -50,12 +55,24 @@ public final class TimeboxClient {
     /// Connect to a discovered device. The SPP RFCOMM channel is auto-resolved
     /// from the device's SDP (pass `channel` only to force a specific one).
     public func connect(to device: TimeboxDevice, channel: UInt8? = nil) async throws {
+        #if os(macOS)
         if let channel {
-            try await transport.connect(to: device, channelID: channel)
-        } else {
-            try await transport.connect(to: device)
+            try await bluetooth.connect(to: device, channelID: channel)
+            return
         }
+        #endif
+        try await transport.connect(to: device)
     }
+
+    #if os(iOS)
+    /// iOS: scan for and connect to the first Timebox advertising over BLE. No pairing
+    /// or prior discovery needed — CoreBluetooth finds it by name (or attaches if the
+    /// system already holds it connected as a speaker).
+    public func connect() async throws {
+        try await transport.connect(to: TimeboxDevice(
+            name: "Timebox", address: "", isPaired: false, isConnected: false, source: .bluetooth))
+    }
+    #endif
 
     /// Connect by Bluetooth address (e.g. `"AA-BB-CC-DD-EE-FF"`). Channel is
     /// auto-resolved unless provided.

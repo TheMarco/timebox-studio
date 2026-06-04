@@ -5,9 +5,10 @@ DerivedData/
 xcuserdata/
 .DS_Store
 
-# Decompiled official Divoom APK — used only for protocol reverse-engineering.
+# Decompiled official Divoom APK / iOS IPA — used only for protocol reverse-engineering.
 # Copyrighted; do not commit.
 apk/
+*.ipa
 
 # Local/ad-hoc test assets
 test.png

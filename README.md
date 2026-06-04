@@ -1,7 +1,7 @@
 # Timebox Studio
 
-Control a Divoom **Timebox Evo** (16×16 RGB LED display) directly from macOS — send
-arbitrary images, solid colors, and brightness — with **no Divoom app, no Node, no
+Control a Divoom **Timebox Evo** (16×16 RGB LED display) directly from **macOS and iOS** —
+send arbitrary images, solid colors, and brightness — with **no Divoom app, no Node, no
 Electron/web server, and no ESP32/Raspberry Pi** in the control path. Pure Swift over
 Apple's native Bluetooth stack.
 
@@ -10,11 +10,19 @@ plus a command-line tool (`timeboxctl`) and a minimal SwiftUI shell.
 
 ## How it works (short version)
 
-The Timebox Evo's LED protocol runs over **Bluetooth Classic SPP/RFCOMM** — *not* BLE.
-(The device also advertises a BLE "Transparent UART" endpoint, but it is not wired to
-the LED protocol; chasing it is a dead end.) The wire format and the image encoding
-were reverse-engineered from the official Divoom Android app and re-implemented natively
-with `IOBluetooth`. See [`DEVELOPMENT_NOTES.md`](DEVELOPMENT_NOTES.md) for the protocol.
+The same image/command encoding drives two transports, selected automatically per platform:
+
+- **macOS → Bluetooth Classic SPP/RFCOMM** (`IOBluetooth`). The Evo's LED protocol runs
+  over Classic SPP; the wire format and image encoding were reverse-engineered from the
+  official Divoom Android app.
+- **iOS → BLE** (`CoreBluetooth`). The device's BLE "Transparent UART" endpoint *is*
+  usable — the trick is the JieLi **RCSP** wrapper (`FE EF AA 55 | LEN | payload | sum16`)
+  and tunneling the **same SPP command bytes** through the device's reliable `01` command
+  channel (`01 <seq> 00 00 00 <SPP command>`). Reverse-engineered from a BLE capture of
+  the official iOS app.
+
+`TimeboxClient` exposes one API (`connect` / `setBrightness` / `setColor` / `send(image:)`)
+over both. See [`DEVELOPMENT_NOTES.md`](DEVELOPMENT_NOTES.md) for the protocol details.
 
 ## Requirements
 
@@ -83,6 +91,22 @@ client.disconnect()
 Call the async methods from a context with a running run loop (any AppKit/SwiftUI app).
 The connection is **persistent** — connect once, then push images/colors at any time.
 
+### On iOS
+
+Same `TimeboxClient`, same `send`/`setColor`/`setBrightness` — only connection differs.
+There is no manual pairing or SDP step; CoreBluetooth finds the device by name (or
+attaches if iOS already holds it connected as a speaker):
+
+```swift
+let client = TimeboxClient()
+try await client.connect()        // iOS-only convenience: scans BLE for the Timebox
+try await client.setBrightness(80)
+try await client.send(image: frame)
+```
+
+Add `NSBluetoothAlwaysUsageDescription` to the app's Info.plist. The transport is
+`CoreBluetoothRCSPTransport` (RCSP over BLE); it is chosen automatically on iOS.
+
 ### Finding the device ("will this work with anyone's Timebox?")
 
 Yes — nothing is hardcoded to one device:
@@ -99,7 +123,8 @@ So any user's Timebox Evo works once they've paired it with their Mac.
 - **`TimeboxKit`** — protocol encoding (`TimeboxPacketEncoder`, `TimeboxImageEncoder`),
   `PixelFrame`/`PixelRGB`, and `ImageToPixelFrameConverter` (PNG/JPG → 16×16, CoreGraphics).
 - **`TimeboxBluetooth`** — `TimeboxClient` (high-level API), `IOBluetoothTimeboxTransport`
-  (Classic SPP), and paired-device discovery.
+  (macOS Classic SPP), `CoreBluetoothRCSPTransport` (iOS/macOS BLE via RCSP), and
+  paired-device discovery.
 
 ## Project layout
 
@@ -116,7 +141,8 @@ TimeboxStudioTests/  packet + image encoding tests
 
 ## Status
 
-- ✅ Images, solid color, brightness — working on real hardware.
+- ✅ Images, solid color, brightness — working on real hardware, **macOS (Classic SPP)
+  and iOS (BLE/RCSP)**.
 - ⬜ Not yet: GIF/animation, a full pixel-editor GUI (the SwiftUI shell is minimal),
   saved-design persistence wired into the UI.
 
