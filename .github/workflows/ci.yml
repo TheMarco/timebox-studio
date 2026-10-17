@@ -1,0 +1,84 @@
+name: Build, test, and deliver
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build all products
+        run: swift build
+
+      - name: Run unit tests
+        run: swift test
+
+      - name: Build release products
+        run: swift build --configuration release
+
+      - name: Package release executables
+        run: |
+          bin_path="$(swift build --configuration release --show-bin-path)"
+          mkdir -p dist
+          cp "$bin_path/timeboxctl" "$bin_path/TimeboxStudio" dist/
+          cp README.md DEVELOPMENT_NOTES.md dist/
+          tar -czf "timebox-studio-macos-${{ matrix.arch }}.tar.gz" -C dist .
+
+      - name: Upload release build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: timebox-studio-macos-${{ matrix.arch }}
+          path: timebox-studio-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    name: iOS library build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build Bluetooth library for iOS
+        run: |
+          swift build \
+            --configuration release \
+            --target TimeboxBluetooth \
+            --triple arm64-apple-ios15.0 \
+            --sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            --scratch-path .build/ios

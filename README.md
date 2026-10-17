@@ -33,10 +33,35 @@ over both. See [`DEVELOPMENT_NOTES.md`](DEVELOPMENT_NOTES.md) for the protocol d
 
 ## Build & test
 
+Tests require the full Xcode installation (for XCTest), with its license accepted
+and initial setup completed. If `xcode-select -p` points to Command Line Tools,
+select Xcode with `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`,
+or prefix the commands below with
+`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+
 ```sh
 swift build
 swift test
 ```
+
+## Continuous integration and delivery
+
+[GitHub Actions](https://github.com/AdrieanKhisbe/timebox-studio/actions/workflows/ci.yml)
+runs on every push, pull requests to `main`, and manual dispatches. It builds all
+products, runs the unit tests, and builds release executables on both Apple Silicon
+and Intel macOS runners. A separate job compiles `TimeboxBluetooth` and its
+dependencies for iOS without signing.
+
+Each successful macOS job delivers a `timebox-studio-macos-arm64` or
+`timebox-studio-macos-x86_64` artifact, retained for 14 days. Download the matching
+artifact from the workflow run, unzip it, then extract its `.tar.gz` archive. It
+contains `timeboxctl`, the standalone `TimeboxStudio` executable, and documentation.
+These are unsigned developer builds; the SwiftUI executable is not an `.app` bundle.
+The workflow does not publish GitHub Releases or deploy to the App Store.
+
+The tests cover hex parsing, pixel-frame validation, packet checksums, and image
+palette encoding. Bluetooth connection and display behavior require a real Timebox
+and are checked manually.
 
 ## Use the CLI
 
